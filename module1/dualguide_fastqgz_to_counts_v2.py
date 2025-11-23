@@ -12,7 +12,7 @@ import pandas as pd
 LOW_QUALITY_THRESHOLD = 20
 
 
-def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True):
+def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True, id_column=None):
     mismatch_dict: dict[str, set[str]] = dict()
     clash_zero = 0
     clash_one = 0
@@ -22,8 +22,12 @@ def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True):
     else:
         col = table[column]
 
-    for sgRNA, seq in col.items():
-        sgRNA_id = str(sgRNA)
+    if id_column is not None:
+        ids = table[id_column].astype(str)
+    else:
+        ids = col.index.astype(str)
+
+    for sgRNA_id, seq in zip(ids, col):
         if seq in mismatch_dict:
             clash_zero += 1
             mismatch_dict[seq].add(sgRNA_id)
@@ -120,7 +124,16 @@ def peek_has_umi(fastq_path):
 
 
 def writeToCounts(fileTup):
-    r1file, r2file, outprefix, mismatchDicts, umiMismatchDict, has_umi, testRun = fileTup
+    (
+        r1file,
+        r2file,
+        outprefix,
+        mismatchDicts,
+        umiMismatchDict,
+        has_umi,
+        testRun,
+        valid_pairs,
+    ) = fileTup
 
     print(f'Processing files: R1={r1file}, R2={r2file}')
     sys.stdout.flush()
@@ -139,6 +152,7 @@ def writeToCounts(fileTup):
         'B sgRNA 1-mismatch match': 0,
         'Reads rescued by pair intersection': 0,
         'Reads unresolved due to pair ambiguity': 0,
+        'Reads with A/B not in library': 0,
     }
 
     if has_umi:
@@ -241,54 +255,55 @@ def writeToCounts(fileTup):
                         statsCounts['UMI multiple mappings'] += 1
 
                 # Pair-level resolution (including rescue from ambiguous A/B)
-                final_a = None
-                final_b = None
+                final_pair_id = None  # sgID_AB
                 rescued = False
 
                 can_attempt_pair = (
-                    a_status != 'none' and
-                    b_status != 'none' and
-                    (not has_umi or umi_status == 'unique')
+                    a_status != 'none'
+                    and b_status != 'none'
+                    and (not has_umi or umi_status == 'unique')
                 )
 
                 if can_attempt_pair:
-                    if a_status == 'unique' and b_status == 'unique':
-                        final_a = next(iter(a_candidates))
-                        final_b = next(iter(b_candidates))
-                    else:
-                        pair_candidates = a_candidates & b_candidates
-                        if len(pair_candidates) == 1:
-                            sg_id = next(iter(pair_candidates))
-                            final_a = sg_id
-                            final_b = sg_id
+                    candidate_pairs = []
+                    for a_id in a_candidates:
+                        for b_id in b_candidates:
+                            sg_ab = valid_pairs.get((a_id, b_id))
+                            if sg_ab:
+                                candidate_pairs.append((a_id, b_id, sg_ab))
+
+                    if len(candidate_pairs) == 1:
+                        final_pair_id = candidate_pairs[0][2]
+                        if len(a_candidates) > 1 or len(b_candidates) > 1:
                             rescued = True
                             statsCounts['Reads rescued by pair intersection'] += 1
-                        else:
-                            if a_status == 'multiple' or b_status == 'multiple':
-                                statsCounts['Reads unresolved due to pair ambiguity'] += 1
+                    elif len(candidate_pairs) > 1:
+                        statsCounts['Reads unresolved due to pair ambiguity'] += 1
+                    else:
+                        # Both mapped but combination not in library
+                        statsCounts['Reads with A/B not in library'] += 1
 
                 # Only count uniquely resolved A+B (whether direct or rescued)
-                if final_a is not None and final_b is not None:
+                if final_pair_id is not None:
                     statsCounts['All sgRNAs uniquely map'] += 1
 
-                    combinedSgId = final_a + '++' + final_b
+                    combinedSgId = final_pair_id
                     if combinedSgId not in pairCounts_sgRNAs:
                         pairCounts_sgRNAs[combinedSgId] = 0
                     pairCounts_sgRNAs[combinedSgId] += 1
 
-                    if final_a != final_b:
-                        statsCounts['A sgRNA and B sgRNA do not match'] += 1
+                    statsCounts['A sgRNA and B sgRNA match'] += 1
+
+                    if has_umi:
+                        combinedSgId_UMI = combinedSgId + '++' + str(next(iter(umi_candidates)) if umi_candidates else "")
                     else:
-                        statsCounts['A sgRNA and B sgRNA match'] += 1
+                        combinedSgId_UMI = combinedSgId
 
-                        if has_umi:
-                            combinedSgId_UMI = combinedSgId + '++' + str(next(iter(umi_candidates)))
-                        else:
-                            combinedSgId_UMI = combinedSgId
-
-                        if combinedSgId_UMI not in pairCounts_double:
-                            pairCounts_double[combinedSgId_UMI] = 0
-                        pairCounts_double[combinedSgId_UMI] += 1
+                    if combinedSgId_UMI not in pairCounts_double:
+                        pairCounts_double[combinedSgId_UMI] = 0
+                    pairCounts_double[combinedSgId_UMI] += 1
+                elif can_attempt_pair:
+                    statsCounts['A sgRNA and B sgRNA do not match'] += 1
 
                 read_count += 1
 
@@ -345,6 +360,7 @@ def writeToCounts(fileTup):
     print('B sgRNAs via 1 mismatch', statsCounts['B sgRNA 1-mismatch match'])
     print('Reads rescued by pair intersection', statsCounts['Reads rescued by pair intersection'])
     print('Reads unresolved due to pair ambiguity', statsCounts['Reads unresolved due to pair ambiguity'])
+    print('Reads with A/B not in library', statsCounts['Reads with A/B not in library'])
 
     sys.stdout.flush()
 
@@ -447,8 +463,7 @@ def read_and_validate_guide_table(path: str, required_cols: list[str]) -> pd.Dat
 
     # Keep only required columns and drop any rows with missing values
     df = df[required_cols].dropna()
-    # Use sgID_AB as the index so barcodes map back to guide IDs instead of integer row numbers
-    df = df.set_index('sgID_AB')
+    # Keep explicit columns; do not set index so we can map sgID_A/B separately
     # convert protospacers to mimic reads according to sequencing strategy, assuming R1=19, R2=19
     df['protospacer_A'] = df['protospacer_A'].str[1:20].str.upper()
     trans = str.maketrans('ATGC', 'TACG')
@@ -608,9 +623,15 @@ if __name__ == '__main__':
 
     print('sgRNAs in library', len(guideTable))
 
+    # Map of valid A/B combos to sgID_AB for downstream pair disambiguation
+    valid_pairs = {
+        (str(row['sgID_A']), str(row['sgID_B'])): str(row['sgID_AB'])
+        for _, row in guideTable.iterrows()
+    }
+
     combinedMismatchDicts = {
-        'protospacer_a_r1': getMismatchDict(guideTable, 'protospacer_A', allowOneMismatch=True),
-        'protospacer_b_r2': getMismatchDict(guideTable, 'protospacer_B', allowOneMismatch=True),
+        'protospacer_a_r1': getMismatchDict(guideTable, 'protospacer_A', allowOneMismatch=True, id_column='sgID_A'),
+        'protospacer_b_r2': getMismatchDict(guideTable, 'protospacer_B', allowOneMismatch=True, id_column='sgID_B'),
     }
 
     umiMismatchDict = read_and_validate_umi_table(args.UMI_Table)
@@ -625,7 +646,7 @@ if __name__ == '__main__':
             if sample_has_umi and umiMismatchDict is None:
                 raise ValueError('UMIs detected in read IDs but no UMI table was provided. Supply --UMI_Table.')
             outputfile = os.path.join(outputDirectory, os.path.split(fastqfile)[-1].split('_R')[0])
-            fileTups.append((r1file, r2file, outputfile, combinedMismatchDicts, umiMismatchDict, sample_has_umi, args.test))
+            fileTups.append((r1file, r2file, outputfile, combinedMismatchDicts, umiMismatchDict, sample_has_umi, args.test, valid_pairs))
 
     pool = multiprocessing.Pool(len(fileTups))
     pool.map(writeToCounts, fileTups)

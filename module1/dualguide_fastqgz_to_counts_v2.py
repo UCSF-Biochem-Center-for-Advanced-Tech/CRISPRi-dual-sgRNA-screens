@@ -3,6 +3,7 @@ import os
 import re
 import argparse
 import gzip
+import io
 import multiprocessing
 from glob import glob
 from typing import List
@@ -11,9 +12,17 @@ import pandas as pd
 DEFAULT_LOW_QUALITY_THRESHOLD = 20
 DEFAULT_TEST_LINES = 100000
 
+NT2BITS = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+
+
+def encode_seq(seq: str) -> int:
+    code = 0
+    for base in seq:
+        code = (code << 2) | NT2BITS.get(base, 0)
+    return code
 
 def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True, id_column=None):
-    mismatch_dict: dict[str, set[str]] = dict()
+    mismatch_dict: dict[int, set[str]] = dict()
     clash_zero = 0
     clash_one = 0
 
@@ -28,22 +37,27 @@ def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True, id_co
         ids = col.index.astype(str)
 
     for sgRNA_id, seq in zip(ids, col):
-        if seq in mismatch_dict:
+        code = encode_seq(seq)
+        if code in mismatch_dict:
             clash_zero += 1
-            mismatch_dict[seq].add(sgRNA_id)
+            mismatch_dict[code].add(sgRNA_id)
         else:
-            mismatch_dict[seq] = {sgRNA_id}
+            mismatch_dict[code] = {sgRNA_id}
 
         if allowOneMismatch:
             for position in range(len(seq)):
-                mismatchSeq = seq[:position] + 'N' + seq[position + 1:]
-
-                if mismatchSeq in mismatch_dict:
-                    if sgRNA_id not in mismatch_dict[mismatchSeq]:
-                        clash_one += 1
-                        mismatch_dict[mismatchSeq].add(sgRNA_id)
-                else:
-                    mismatch_dict[mismatchSeq] = {sgRNA_id}
+                orig_bits = NT2BITS[seq[position]]
+                shift = 2 * (len(seq) - 1 - position)
+                for alt_bits in (0, 1, 2, 3):
+                    if alt_bits == orig_bits:
+                        continue
+                    alt_code = code ^ ((orig_bits ^ alt_bits) << shift)
+                    if alt_code in mismatch_dict:
+                        if sgRNA_id not in mismatch_dict[alt_code]:
+                            clash_one += 1
+                            mismatch_dict[alt_code].add(sgRNA_id)
+                    else:
+                        mismatch_dict[alt_code] = {sgRNA_id}
 
     if clash_zero or clash_one:
         summary = []
@@ -69,27 +83,45 @@ def matchBarcode(mismatch_dict, barcode, allowOneMismatch=True, quality=None, lo
     candidates: set[str] = set()
     used_mismatch = False
 
-    direct = mismatch_dict.get(barcode)
+    code = encode_seq(barcode)
+    direct = mismatch_dict.get(code)
     if direct:
         candidates.update(direct)
 
     # Only search 1-mismatch neighborhood if no exact match and mismatches allowed
     if not candidates and allowOneMismatch:
         mismatch_hits: set[str] = set()
+        length = len(barcode)
+        try:
+            base_bits = [NT2BITS[b] for b in barcode]
+        except KeyError:
+            return 'none', used_mismatch, set()
         if quality is not None and low_q_threshold is not None:
             low_q_positions = [
                 idx for idx, qchar in enumerate(quality)
                 if (ord(qchar) - 33) < low_q_threshold
             ]
             for position in low_q_positions:
-                mismatchSeq = barcode[:position] + 'N' + barcode[position + 1:]
-                if mismatchSeq in mismatch_dict:
-                    mismatch_hits.update(mismatch_dict[mismatchSeq])
+                orig_bits = base_bits[position]
+                shift = 2 * (length - 1 - position)
+                for alt_bits in (0, 1, 2, 3):
+                    if alt_bits == orig_bits:
+                        continue
+                    alt_code = code ^ ((orig_bits ^ alt_bits) << shift)
+                    hits = mismatch_dict.get(alt_code)
+                    if hits:
+                        mismatch_hits.update(hits)
         else:
-            for position in range(len(barcode)):
-                mismatchSeq = barcode[:position] + 'N' + barcode[position + 1:]
-                if mismatchSeq in mismatch_dict:
-                    mismatch_hits.update(mismatch_dict[mismatchSeq])
+            for position in range(length):
+                orig_bits = base_bits[position]
+                shift = 2 * (length - 1 - position)
+                for alt_bits in (0, 1, 2, 3):
+                    if alt_bits == orig_bits:
+                        continue
+                    alt_code = code ^ ((orig_bits ^ alt_bits) << shift)
+                    hits = mismatch_dict.get(alt_code)
+                    if hits:
+                        mismatch_hits.update(hits)
 
         if mismatch_hits:
             used_mismatch = True
@@ -181,7 +213,9 @@ def writeToCounts(fileTup):
     current_umi = None
     read_count = 0
 
-    with gzip.open(r1file) as infile_r1, gzip.open(r2file) as infile_r2:
+    with gzip.open(r1file) as infile_r1_raw, gzip.open(r2file) as infile_r2_raw:
+        infile_r1 = io.BufferedReader(infile_r1_raw, buffer_size=1024 * 1024)
+        infile_r2 = io.BufferedReader(infile_r2_raw, buffer_size=1024 * 1024)
         r1_seq = None
         r2_seq = None
         r1_qual = None

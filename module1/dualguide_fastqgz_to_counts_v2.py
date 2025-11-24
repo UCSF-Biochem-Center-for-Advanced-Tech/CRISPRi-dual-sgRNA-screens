@@ -8,21 +8,21 @@ import multiprocessing
 from glob import glob
 from typing import List
 import pandas as pd
+# Allow running as script by adding module path when not installed as a package
+if __name__ == "__main__":
+    sys.path.append(os.path.dirname(__file__))
+import matrix_utils
+try:
+    import anndata as ad
+    ANNDATA_AVAILABLE = True
+except ImportError:
+    ANNDATA_AVAILABLE = False
 
 DEFAULT_LOW_QUALITY_THRESHOLD = 20
 DEFAULT_TEST_LINES = 100000
 
-NT2BITS = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-
-
-def encode_seq(seq: str) -> int:
-    code = 0
-    for base in seq:
-        code = (code << 2) | NT2BITS.get(base, 0)
-    return code
-
 def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True, id_column=None):
-    mismatch_dict: dict[int, set[str]] = dict()
+    mismatch_dict: dict[str, set[str]] = dict()
     clash_zero = 0
     clash_one = 0
 
@@ -37,27 +37,22 @@ def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True, id_co
         ids = col.index.astype(str)
 
     for sgRNA_id, seq in zip(ids, col):
-        code = encode_seq(seq)
-        if code in mismatch_dict:
+        if seq in mismatch_dict:
             clash_zero += 1
-            mismatch_dict[code].add(sgRNA_id)
+            mismatch_dict[seq].add(sgRNA_id)
         else:
-            mismatch_dict[code] = {sgRNA_id}
+            mismatch_dict[seq] = {sgRNA_id}
 
         if allowOneMismatch:
             for position in range(len(seq)):
-                orig_bits = NT2BITS[seq[position]]
-                shift = 2 * (len(seq) - 1 - position)
-                for alt_bits in (0, 1, 2, 3):
-                    if alt_bits == orig_bits:
-                        continue
-                    alt_code = code ^ ((orig_bits ^ alt_bits) << shift)
-                    if alt_code in mismatch_dict:
-                        if sgRNA_id not in mismatch_dict[alt_code]:
-                            clash_one += 1
-                            mismatch_dict[alt_code].add(sgRNA_id)
-                    else:
-                        mismatch_dict[alt_code] = {sgRNA_id}
+                mismatchSeq = seq[:position] + 'N' + seq[position + 1:]
+
+                if mismatchSeq in mismatch_dict:
+                    if sgRNA_id not in mismatch_dict[mismatchSeq]:
+                        clash_one += 1
+                        mismatch_dict[mismatchSeq].add(sgRNA_id)
+                else:
+                    mismatch_dict[mismatchSeq] = {sgRNA_id}
 
     if clash_zero or clash_one:
         summary = []
@@ -83,8 +78,7 @@ def matchBarcode(mismatch_dict, barcode, allowOneMismatch=True, quality=None, lo
     candidates: set[str] = set()
     used_mismatch = False
 
-    code = encode_seq(barcode)
-    direct = mismatch_dict.get(code)
+    direct = mismatch_dict.get(barcode)
     if direct:
         candidates.update(direct)
 
@@ -92,36 +86,22 @@ def matchBarcode(mismatch_dict, barcode, allowOneMismatch=True, quality=None, lo
     if not candidates and allowOneMismatch:
         mismatch_hits: set[str] = set()
         length = len(barcode)
-        try:
-            base_bits = [NT2BITS[b] for b in barcode]
-        except KeyError:
-            return 'none', used_mismatch, set()
         if quality is not None and low_q_threshold is not None:
             low_q_positions = [
                 idx for idx, qchar in enumerate(quality)
                 if (ord(qchar) - 33) < low_q_threshold
             ]
             for position in low_q_positions:
-                orig_bits = base_bits[position]
-                shift = 2 * (length - 1 - position)
-                for alt_bits in (0, 1, 2, 3):
-                    if alt_bits == orig_bits:
-                        continue
-                    alt_code = code ^ ((orig_bits ^ alt_bits) << shift)
-                    hits = mismatch_dict.get(alt_code)
-                    if hits:
-                        mismatch_hits.update(hits)
+                mismatchSeq = barcode[:position] + 'N' + barcode[position + 1:]
+                hits = mismatch_dict.get(mismatchSeq)
+                if hits:
+                    mismatch_hits.update(hits)
         else:
             for position in range(length):
-                orig_bits = base_bits[position]
-                shift = 2 * (length - 1 - position)
-                for alt_bits in (0, 1, 2, 3):
-                    if alt_bits == orig_bits:
-                        continue
-                    alt_code = code ^ ((orig_bits ^ alt_bits) << shift)
-                    hits = mismatch_dict.get(alt_code)
-                    if hits:
-                        mismatch_hits.update(hits)
+                mismatchSeq = barcode[:position] + 'N' + barcode[position + 1:]
+                hits = mismatch_dict.get(mismatchSeq)
+                if hits:
+                    mismatch_hits.update(hits)
 
         if mismatch_hits:
             used_mismatch = True
@@ -175,6 +155,9 @@ def writeToCounts(fileTup):
         sgid_order,
         write_stats_file,
         write_stats_json,
+        count_first,
+        write_offlibrary,
+        write_anndata,
     ) = fileTup
 
     print(f'Processing files: R1={r1file}, R2={r2file}', file=sys.stderr)
@@ -209,6 +192,7 @@ def writeToCounts(fileTup):
     pairCounts_sgRNAs = dict()
     pairCounts_double = dict()
     unique_umis_per_guide: dict[str, set[str]] = {} if has_umi else {}
+    offlibrary_counts: dict[str, int] = {}
 
     current_umi = None
     read_count = 0
@@ -331,11 +315,13 @@ def writeToCounts(fileTup):
                         if len(a_candidates) > 1 or len(b_candidates) > 1:
                             rescued = True
                             statsCounts['Reads rescued by pair intersection'] += 1
-                    elif len(candidate_pairs) > 1:
-                        statsCounts['Reads unresolved due to pair ambiguity'] += 1
-                    else:
-                        # Both mapped but combination not in library
-                        statsCounts['Reads with A/B not in library'] += 1
+                elif len(candidate_pairs) > 1:
+                    statsCounts['Reads unresolved due to pair ambiguity'] += 1
+                else:
+                    # Both mapped but combination not in library
+                    statsCounts['Reads with A/B not in library'] += 1
+                    offlibrary_key = f"{'|'.join(sorted(a_candidates))}++{'|'.join(sorted(b_candidates))}"
+                    offlibrary_counts[offlibrary_key] = offlibrary_counts.get(offlibrary_key, 0) + 1
 
                 # Only count uniquely resolved A+B (whether direct or rescued)
                 if final_pair_id is not None:
@@ -461,6 +447,27 @@ def writeToCounts(fileTup):
 
     print()
 
+    if write_offlibrary and offlibrary_counts:
+        offlib_path = outprefix + '.offlibrary.counts.txt'
+        with open(offlib_path, 'w') as off:
+            for key, val in sorted(offlibrary_counts.items()):
+                off.write(f"{key}\t{val}\n")
+        print(f"{os.path.basename(outprefix)}: wrote {len(offlibrary_counts)} off-library A/B combos to .offlibrary.counts.txt", file=sys.stderr)
+
+    if write_anndata:
+        if not ANNDATA_AVAILABLE:
+            print("anndata not installed; skipping AnnData export", file=sys.stderr)
+        else:
+            # Build AnnData with mapped counts
+            adata = ad.AnnData(
+                X=pd.DataFrame(pairCounts_double, index=[0]).T.reindex(sgid_order).fillna(0),
+            )
+            adata.write_h5ad(outprefix + '.h5ad')
+            if write_offlibrary and offlibrary_counts:
+                off_df = pd.DataFrame(offlibrary_counts, index=[0]).T
+                ad_off = ad.AnnData(X=off_df)
+                ad_off.write_h5ad(outprefix + '.offlibrary.h5ad')
+
     sys.stdout.flush()
 
 
@@ -528,6 +535,26 @@ def parse_args():
         "--write-stats-json",
         action="store_true",
         help="Also write per-sample stats to {outprefix}.stats.json in addition to printing to stdout.",
+    )
+    parser.add_argument(
+        "--count-first",
+        action="store_true",
+        help="Count identical protospacer pairs first, then map unique pairs to the library (faster when duplication is high).",
+    )
+    parser.add_argument(
+        "--write-offlibrary",
+        action="store_true",
+        help="Write counts for off-library A/B combinations to {outprefix}.offlibrary.counts.txt.",
+    )
+    parser.add_argument(
+        "--write-anndata",
+        action="store_true",
+        help="Write AnnData objects for mapped counts (and off-library if requested).",
+    )
+    parser.add_argument(
+        "--write-count-matrix",
+        action="store_true",
+        help="After processing, merge per-sample count files into counts matrices (.AB.match and .all.aligned) in the output directory.",
     )
     return parser.parse_args()
 
@@ -786,6 +813,9 @@ if __name__ == '__main__':
                     sgid_order,
                     args.write_stats_file,
                     args.write_stats_json,
+                    args.write_offlibrary,
+                    args.count_first,
+                    args.write_anndata,
                 )
             )
 
@@ -793,3 +823,7 @@ if __name__ == '__main__':
     pool.map(writeToCounts, fileTups)
     pool.close()
     pool.join()
+
+    if args.write_count_matrix:
+        # Build matrices for both AB.match and all.aligned
+        matrix_utils.write_matrices(outputDirectory, sgid_order)

@@ -9,9 +9,11 @@ from glob import glob
 from typing import List
 import pandas as pd
 # Allow running as script by adding module path when not installed as a package
-if __name__ == "__main__":
+try:
+    import matrix_utils
+except ImportError:
     sys.path.append(os.path.dirname(__file__))
-import matrix_utils
+    import matrix_utils
 try:
     import anndata as ad
     ANNDATA_AVAILABLE = True
@@ -315,13 +317,13 @@ def writeToCounts(fileTup):
                         if len(a_candidates) > 1 or len(b_candidates) > 1:
                             rescued = True
                             statsCounts['Reads rescued by pair intersection'] += 1
-                elif len(candidate_pairs) > 1:
-                    statsCounts['Reads unresolved due to pair ambiguity'] += 1
-                else:
-                    # Both mapped but combination not in library
-                    statsCounts['Reads with A/B not in library'] += 1
-                    offlibrary_key = f"{'|'.join(sorted(a_candidates))}++{'|'.join(sorted(b_candidates))}"
-                    offlibrary_counts[offlibrary_key] = offlibrary_counts.get(offlibrary_key, 0) + 1
+                    elif len(candidate_pairs) > 1:
+                        statsCounts['Reads unresolved due to pair ambiguity'] += 1
+                    else:
+                        # Both mapped but combination not in library
+                        statsCounts['Reads with A/B not in library'] += 1
+                        offlibrary_key = f"{'|'.join(sorted(a_candidates))}++{'|'.join(sorted(b_candidates))}"
+                        offlibrary_counts[offlibrary_key] = offlibrary_counts.get(offlibrary_key, 0) + 1
 
                 # Only count uniquely resolved A+B (whether direct or rescued)
                 if final_pair_id is not None:
@@ -795,7 +797,10 @@ if __name__ == '__main__':
             r2file = fastqfile
             sample_has_umi = peek_has_umi(r1file)
             use_umi_whitelist = umiMismatchDict is not None
-            outputfile = os.path.join(outputDirectory, os.path.split(fastqfile)[-1].split('_R')[0])
+            sample_name = os.path.split(fastqfile)[-1].split('_R')[0]
+            # Drop trailing Illumina chunk like _S##_L00# if present for consistency
+            sample_name = re.sub(r"_S\\d+_L\\d+$", "", sample_name)
+            outputfile = os.path.join(outputDirectory, sample_name)
             fileTups.append(
                 (
                     r1file,

@@ -10,16 +10,14 @@ def load_counts_file(path: str) -> pd.Series:
 
 def merge_counts(count_files: list[str], sgid_order: list[str]) -> pd.DataFrame:
     samples = [os.path.basename(f).split(".")[0] for f in count_files]
-    first_series = load_counts_file(count_files[0]).reindex(sgid_order).fillna(0)
+    first_series = load_counts_file(count_files[0]).reindex(sgid_order).fillna(0).astype(int)
     matrix = pd.DataFrame(index=sgid_order)
     matrix[samples[0]] = first_series.values
     for sample, path in zip(samples[1:], count_files[1:]):
-        series = load_counts_file(path).reindex(sgid_order).fillna(0)
+        series = load_counts_file(path).reindex(sgid_order).fillna(0).astype(int)
         matrix[sample] = series.values
-    matrix.insert(0, "target", matrix.index.str.split("_").str[0])
+    matrix.insert(0, "target", matrix.index.astype(str).str.split("_").str[0])
     matrix = matrix.fillna(0)
-    num_cols = matrix.columns[1:]
-    matrix[num_cols] = matrix[num_cols].astype(int)
     return matrix
 
 

@@ -8,6 +8,17 @@ import multiprocessing
 from glob import glob
 from typing import List
 import pandas as pd
+# Silence pandas implicit modification warnings globally
+import warnings
+warnings.filterwarnings("ignore", message=".*ImplicitModificationWarning.*")
+import warnings
+
+# Silence pandas implicit modification warnings from index coercion
+try:
+    from pandas.errors import ImplicitModificationWarning
+    warnings.filterwarnings("ignore", category=ImplicitModificationWarning)
+except Exception:
+    warnings.filterwarnings("ignore", message=".*ImplicitModificationWarning.*")
 # Allow running as script by adding module path when not installed as a package
 try:
     import matrix_utils
@@ -157,7 +168,6 @@ def writeToCounts(fileTup):
         sgid_order,
         write_stats_file,
         write_stats_json,
-        count_first,
         write_offlibrary,
         write_anndata,
     ) = fileTup
@@ -188,12 +198,11 @@ def writeToCounts(fileTup):
             'UMI not mapped': 0,
             'UMI multiple mappings': 0,
             'UMI present in reads': 0,
-            'UMI duplicate reads (collapsed)': 0,
         })
 
     pairCounts_sgRNAs = dict()
     pairCounts_double = dict()
-    unique_umis_per_guide: dict[str, set[str]] = {} if has_umi else {}
+    # No dedup; UMI is part of the key
     offlibrary_counts: dict[str, int] = {}
 
     current_umi = None
@@ -322,7 +331,8 @@ def writeToCounts(fileTup):
                     else:
                         # Both mapped but combination not in library
                         statsCounts['Reads with A/B not in library'] += 1
-                        offlibrary_key = f"{'|'.join(sorted(a_candidates))}++{'|'.join(sorted(b_candidates))}"
+                        umi_suffix = f"++{current_umi}" if has_umi and current_umi else ""
+                        offlibrary_key = f"{'|'.join(sorted(a_candidates))}++{'|'.join(sorted(b_candidates))}{umi_suffix}"
                         offlibrary_counts[offlibrary_key] = offlibrary_counts.get(offlibrary_key, 0) + 1
 
                 # Only count uniquely resolved A+B (whether direct or rescued)
@@ -337,12 +347,8 @@ def writeToCounts(fileTup):
 
                     if has_umi:
                         umi_str = str(next(iter(umi_candidates)) if umi_candidates else "")
-                        seen = unique_umis_per_guide.setdefault(combinedSgId, set())
-                        if umi_str not in seen:
-                            seen.add(umi_str)
-                            pairCounts_double[combinedSgId] = pairCounts_double.get(combinedSgId, 0) + 1
-                        else:
-                            statsCounts['UMI duplicate reads (collapsed)'] += 1
+                        combined_key = combinedSgId + '++' + umi_str
+                        pairCounts_double[combined_key] = pairCounts_double.get(combined_key, 0) + 1
                     else:
                         pairCounts_double[combinedSgId] = pairCounts_double.get(combinedSgId, 0) + 1
                 elif can_attempt_pair:
@@ -355,8 +361,12 @@ def writeToCounts(fileTup):
             outfile.write(pair + '\t' + str(pairCounts_sgRNAs.get(pair, 0)) + '\n')
 
     with open(outprefix + '.AB.match.counts.txt', 'w') as outfile:
-        for pair in sgid_order:
-            outfile.write(pair + '\t' + str(pairCounts_double.get(pair, 0)) + '\n')
+        if has_umi:
+            for key in sorted(pairCounts_double.keys()):
+                outfile.write(key + '\t' + str(pairCounts_double[key]) + '\n')
+        else:
+            for pair in sgid_order:
+                outfile.write(pair + '\t' + str(pairCounts_double.get(pair, 0)) + '\n')
     # stderr summary for file outputs
     written_all = sum(pairCounts_sgRNAs.values())
     written_ab = sum(pairCounts_double.values())
@@ -424,19 +434,18 @@ def writeToCounts(fileTup):
         "ab_not_in_library": not_in_library,
     })
     if has_umi:
-        dedup_molecules = sum(pairCounts_double.values())
-        guides_with_molecules = len(pairCounts_double)
-        stats_lines.append(f"Molecules after UMI dedup (total) {dedup_molecules}")
-        stats_lines.append(f"Guides with ≥1 deduped molecule {guides_with_molecules}")
-        stats_lines.append(f"Reads collapsed as UMI duplicates {statsCounts['UMI duplicate reads (collapsed)']}")
+        umi_events = sum(pairCounts_double.values())
+        guides_with_umis = len(pairCounts_double)
+        stats_lines.append(f"UMI-tagged events (A/B/UMI) {umi_events}")
+        stats_lines.append(f"Guides with ≥1 UMI-tagged event {guides_with_umis}")
         stats_dict.update({
-            "molecules_after_dedup": dedup_molecules,
-            "guides_with_molecules": guides_with_molecules,
-            "reads_collapsed_umi_dups": statsCounts['UMI duplicate reads (collapsed)'],
+            "umi_tagged_events": umi_events,
+            "guides_with_umi_events": guides_with_umis,
         })
 
-    for line in stats_lines:
-        print(line)
+    if not (write_stats_file or write_stats_json):
+        for line in stats_lines:
+            print(line)
     if write_stats_file:
         stats_path = outprefix + '.stats.txt'
         with open(stats_path, 'w') as sf:
@@ -449,25 +458,39 @@ def writeToCounts(fileTup):
 
     print()
 
-    if write_offlibrary and offlibrary_counts:
+    if write_offlibrary:
         offlib_path = outprefix + '.offlibrary.counts.txt'
         with open(offlib_path, 'w') as off:
             for key, val in sorted(offlibrary_counts.items()):
                 off.write(f"{key}\t{val}\n")
-        print(f"{os.path.basename(outprefix)}: wrote {len(offlibrary_counts)} off-library A/B combos to .offlibrary.counts.txt", file=sys.stderr)
+        print(
+            f"{os.path.basename(outprefix)}: wrote {len(offlibrary_counts)} off-library A/B combos to .offlibrary.counts.txt",
+            file=sys.stderr,
+        )
 
     if write_anndata:
         if not ANNDATA_AVAILABLE:
             print("anndata not installed; skipping AnnData export", file=sys.stderr)
         else:
-            # Build AnnData with mapped counts
-            adata = ad.AnnData(
-                X=pd.DataFrame(pairCounts_double, index=[0]).T.reindex(sgid_order).fillna(0),
-            )
+            if has_umi:
+                # pivot guide x UMI
+                rows = {}
+                for key, val in pairCounts_double.items():
+                    if '++' in key:
+                        guide, umi = key.split('++', 1)
+                    else:
+                        guide, umi = key, ''
+                    rows.setdefault(guide, {})[umi] = val
+                adata_df = pd.DataFrame.from_dict(rows, orient='index').reindex(pd.Index(sgid_order, dtype=str)).fillna(0)
+                adata = ad.AnnData(X=adata_df)
+            else:
+                adata = ad.AnnData(
+                    X=pd.DataFrame(pairCounts_double, index=[0]).T.reindex(pd.Index(sgid_order, dtype=str)).fillna(0),
+                )
             adata.write_h5ad(outprefix + '.h5ad')
-            if write_offlibrary and offlibrary_counts:
-                off_df = pd.DataFrame(offlibrary_counts, index=[0]).T
-                ad_off = ad.AnnData(X=off_df)
+            if write_offlibrary:
+                off_df = pd.DataFrame(offlibrary_counts, index=[0]).T if offlibrary_counts else pd.DataFrame()
+                ad_off = ad.AnnData(X=off_df) if not off_df.empty else ad.AnnData(X=pd.DataFrame())
                 ad_off.write_h5ad(outprefix + '.offlibrary.h5ad')
 
     sys.stdout.flush()
@@ -537,11 +560,6 @@ def parse_args():
         "--write-stats-json",
         action="store_true",
         help="Also write per-sample stats to {outprefix}.stats.json in addition to printing to stdout.",
-    )
-    parser.add_argument(
-        "--count-first",
-        action="store_true",
-        help="Count identical protospacer pairs first, then map unique pairs to the library (faster when duplication is high).",
     )
     parser.add_argument(
         "--write-offlibrary",
@@ -799,7 +817,7 @@ if __name__ == '__main__':
             use_umi_whitelist = umiMismatchDict is not None
             sample_name = os.path.split(fastqfile)[-1].split('_R')[0]
             # Drop trailing Illumina chunk like _S##_L00# if present for consistency
-            sample_name = re.sub(r"_S\\d+_L\\d+$", "", sample_name)
+            sample_name = re.sub(r"_S\d+_L\d+$", "", sample_name)
             outputfile = os.path.join(outputDirectory, sample_name)
             fileTups.append(
                 (
@@ -819,7 +837,6 @@ if __name__ == '__main__':
                     args.write_stats_file,
                     args.write_stats_json,
                     args.write_offlibrary,
-                    args.count_first,
                     args.write_anndata,
                 )
             )

@@ -7,7 +7,7 @@ This module processes paired-end dual-sgRNA FASTQ files into count tables with o
 - UMI handling:
   - Uses a UMI whitelist when provided (`--UMI_Table`).
   - If UMIs are present in read headers but no UMI table is provided, accepts raw UMIs (no whitelist).
-  - Produces read-level counts (`*.all.aligned.counts.txt`) and UMI-deduped molecule counts (`*.AB.match.counts.txt`).
+  - Produces read-level counts (`*.all.aligned.counts.txt`) and UMI-tagged counts (`*.AB.match.counts.txt`, keyed by `sgID_AB++UMI`).
 - Robust input validation (guide table columns, file pairing, output directory).
 - Detailed stats to stdout; progress to stderr; optional text/JSON stats files.
 - Parameterized test subset, quality threshold, UMI mismatch option, and buffered FASTQ reading.
@@ -63,7 +63,7 @@ python module1/dualguide_fastqgz_to_counts_v2.py \\
 
 ### Outputs (per sample)
 - `{outprefix}.all.aligned.counts.txt` — read-level counts keyed by sgID_AB; zero-filled and ordered by the guide table.
-- `{outprefix}.AB.match.counts.txt` — UMI-deduped molecule counts keyed by sgID_AB (or read-level if no UMIs); zero-filled and ordered by the guide table.
+- `{outprefix}.AB.match.counts.txt` — UMI-tagged counts keyed by `sgID_AB++UMI` (or sgID_AB if no UMIs). Zero-filled for guides; observed UMIs are included per guide.
 - `{outprefix}.offlibrary.counts.txt` (opt): off-library A/B combinations.
 - `{outprefix}.h5ad` / `{outprefix}.offlibrary.h5ad` (opt): AnnData exports if `--write-anndata` and `anndata` is installed.
 - `{outprefix}.stats.txt` / `{outprefix}.stats.json` (optional) — per-sample stats.
@@ -76,7 +76,7 @@ python module1/count_files_to_counts_matrix_v2.py \\
   counts_dir out_dir \\
   --suffix .AB.match.counts.txt   # or .all.aligned.counts.txt for read-level
 ```
-Assumes all count files share the same sgID_AB order (as emitted by v2).
+For `.all.aligned` (read-level), rows follow the guide order. For `.AB.match` (UMI-tagged), rows = `sgID_AB` and columns = `sample-UMI` combinations, aggregating all observed UMIs across samples.
 
 ## Notes
 - Off-library pairs: Reads where A and B each map but the combination isn’t in the guide table are counted and reported; they are not assigned.

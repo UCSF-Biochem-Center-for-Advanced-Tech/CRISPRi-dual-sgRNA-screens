@@ -11,7 +11,8 @@ import pandas as pd
 # Silence pandas implicit modification warnings globally
 import warnings
 warnings.filterwarnings("ignore", message=".*ImplicitModificationWarning.*")
-import warnings
+warnings.filterwarnings("ignore", message=".*Transforming to str index.*")
+warnings.filterwarnings("ignore", message=".*PerformanceWarning: DataFrame is highly fragmented.*")
 
 # Silence pandas implicit modification warnings from index coercion
 try:
@@ -73,7 +74,7 @@ def getMismatchDict(table, column, trim_range=None, allowOneMismatch=True, id_co
             summary.append(f'{clash_zero} exact collisions')
         if clash_one:
             summary.append(f'{clash_one} one-mismatch collisions')
-        print(
+            print(
             f"{column}: {'; '.join(summary)}; storing all candidates, will require disambiguation at pair level.",
             file=sys.stderr,
         )
@@ -129,10 +130,10 @@ def matchBarcode(mismatch_dict, barcode, allowOneMismatch=True, quality=None, lo
 
 def parse_umi_from_header(header_line):
     """
-    Parse the UMI from a FASTQ header line if present.
+    Parse the UIB (integration barcode) from a FASTQ header line if present.
     Header formats:
-      without UMI: @...:1080 1:N:0:ACTCGNTA
-      with UMI   : @...:1080:TCAGTCGA 1:N:0:ACTCGNTA
+      without UIB: @...:1080 1:N:0:ACTCGNTA
+      with UIB   : @...:1080:TCAGTCGA 1:N:0:ACTCGNTA
     """
     header = header_line.decode('utf-8').strip()
     first_token = header.split(' ')[0]
@@ -180,7 +181,7 @@ def writeToCounts(fileTup):
         'B sgRNA not mapped': 0,
         'A sgRNA multiple mappings': 0,
         'B sgRNA multiple mappings': 0,
-        'All sgRNAs uniquely map': 0,  # A and B (and UMI if present) unique, before pair validation
+        'All sgRNAs uniquely map': 0,  # A and B (and UIB if present) unique, before pair validation
         'Valid library A/B pair': 0,
         'A sgRNA and B sgRNA do not match': 0,
         'A sgRNA and B sgRNA match': 0,
@@ -195,14 +196,14 @@ def writeToCounts(fileTup):
 
     if has_umi:
         statsCounts.update({
-            'UMI not mapped': 0,
-            'UMI multiple mappings': 0,
-            'UMI present in reads': 0,
+            'UIB not mapped': 0,
+            'UIB multiple mappings': 0,
+            'UIB present in reads': 0,
         })
 
     pairCounts_sgRNAs = dict()
     pairCounts_double = dict()
-    # No dedup; UMI is part of the key
+    # No dedup; UIB is part of the key
     offlibrary_counts: dict[str, int] = {}
 
     current_umi = None
@@ -222,7 +223,7 @@ def writeToCounts(fileTup):
             if i % 4 == 0:
                 current_umi = parse_umi_from_header(r1) if has_umi else None
                 if has_umi and current_umi is not None:
-                    statsCounts['UMI present in reads'] += 1
+                    statsCounts['UIB present in reads'] += 1
             elif i % 4 == 1:
                 r1_seq = r1.strip().decode('utf-8')
                 r2_seq = r2.strip().decode('utf-8')
@@ -254,15 +255,11 @@ def writeToCounts(fileTup):
 
                 umi_candidates = set()
                 if has_umi:
-                    if use_umi_whitelist:
-                        umi_call, umi_used_mismatch, umi_candidates = matchBarcode(
-                            umiMismatchDict,
-                            current_umi if current_umi else '',
-                            allowOneMismatch=umi_allow_one_mismatch,
-                        )
-                    else:
-                        if current_umi:
-                            umi_candidates = {current_umi}
+                    umi_call, umi_used_mismatch, umi_candidates = matchBarcode(
+                        umiMismatchDict,
+                        current_umi if current_umi else '',
+                        allowOneMismatch=umi_allow_one_mismatch,
+                    )
 
                 def status(cands: set[str]) -> str:
                     if not cands:
@@ -298,9 +295,9 @@ def writeToCounts(fileTup):
 
                 if has_umi:
                     if umi_status == 'none':
-                        statsCounts['UMI not mapped'] += 1
+                        statsCounts['UIB not mapped'] += 1
                     elif umi_status == 'multiple':
-                        statsCounts['UMI multiple mappings'] += 1
+                        statsCounts['UIB multiple mappings'] += 1
 
                 # Pair-level resolution (including rescue from ambiguous A/B)
                 final_pair_id = None  # sgID_AB
@@ -362,8 +359,16 @@ def writeToCounts(fileTup):
 
     with open(outprefix + '.AB.match.counts.txt', 'w') as outfile:
         if has_umi:
-            for key in sorted(pairCounts_double.keys()):
-                outfile.write(key + '\t' + str(pairCounts_double[key]) + '\n')
+            # Write as wide matrix: rows = sgID_AB, cols = UIBs
+            umi_values = sorted({key.split('++', 1)[1] if '++' in key else '' for key in pairCounts_double.keys()})
+            header = ['sgID_AB'] + umi_values
+            outfile.write('\t'.join(header) + '\n')
+            for guide in sgid_order:
+                row = [guide]
+                for umi in umi_values:
+                    key = guide + ('++' + umi if umi else '')
+                    row.append(str(pairCounts_double.get(key, 0)))
+                outfile.write('\t'.join(row) + '\n')
         else:
             for pair in sgid_order:
                 outfile.write(pair + '\t' + str(pairCounts_double.get(pair, 0)) + '\n')
@@ -406,15 +411,15 @@ def writeToCounts(fileTup):
         "B_multi": multi_b,
     })
     if has_umi:
-        mapped_umi = numReads - statsCounts['UMI not mapped']
-        multi_umi = statsCounts['UMI multiple mappings']
-        stats_lines.append(f"Total UMIs parsed from headers {statsCounts['UMI present in reads']}")
-        stats_lines.append(f"UMIs mapping {mapped_umi} ({mapped_umi * 100.0 / numReads:.2f}%)")
-        stats_lines.append(f"  UMIs multi-match {multi_umi}")
+        mapped_umi = numReads - statsCounts['UIB not mapped']
+        multi_umi = statsCounts['UIB multiple mappings']
+        stats_lines.append(f"Total UIBs parsed from headers {statsCounts['UIB present in reads']}")
+        stats_lines.append(f"UIBs mapping {mapped_umi} ({mapped_umi * 100.0 / numReads:.2f}%)")
+        stats_lines.append(f"  UIBs multi-match {multi_umi}")
         stats_dict.update({
-            "UMIs_parsed": statsCounts['UMI present in reads'],
-            "UMIs_mapped": mapped_umi,
-            "UMIs_multi": multi_umi,
+            "UIBs_parsed": statsCounts['UIB present in reads'],
+            "UIBs_mapped": mapped_umi,
+            "UIBs_multi": multi_umi,
         })
     both_unique = statsCounts['All sgRNAs uniquely map']
     valid_pairs_assigned = statsCounts['Valid library A/B pair']
@@ -422,7 +427,7 @@ def writeToCounts(fileTup):
     unresolved = statsCounts['Reads unresolved due to pair ambiguity']
     not_in_library = statsCounts['Reads with A/B not in library']
 
-    stats_lines.append(f"Reads with A, B, and UMI mapped (pre-pair validation) {both_unique}")
+    stats_lines.append(f"Reads with A, B, and UIB mapped (pre-pair validation) {both_unique}")
     stats_lines.append(f"  Assigned to valid library A/B pair {valid_pairs_assigned} (includes {rescued} rescued by pair intersection)")
     stats_lines.append(f"  Unresolved due to pair ambiguity {unresolved}")
     stats_lines.append(f"  A/B combo not present in library {not_in_library}")
@@ -434,13 +439,13 @@ def writeToCounts(fileTup):
         "ab_not_in_library": not_in_library,
     })
     if has_umi:
-        umi_events = sum(pairCounts_double.values())
-        guides_with_umis = len(pairCounts_double)
-        stats_lines.append(f"UMI-tagged events (A/B/UMI) {umi_events}")
-        stats_lines.append(f"Guides with ≥1 UMI-tagged event {guides_with_umis}")
+        uib_events = sum(pairCounts_double.values())
+        guides_with_uib_events = len(pairCounts_double)
+        stats_lines.append(f"UIB-tagged events (A/B/UIB) {uib_events}")
+        stats_lines.append(f"Guides with ≥1 UIB-tagged event {guides_with_uib_events}")
         stats_dict.update({
-            "umi_tagged_events": umi_events,
-            "guides_with_umi_events": guides_with_umis,
+            "uib_tagged_events": uib_events,
+            "guides_with_uib_events": guides_with_uib_events,
         })
 
     if not (write_stats_file or write_stats_json):
@@ -473,7 +478,7 @@ def writeToCounts(fileTup):
             print("anndata not installed; skipping AnnData export", file=sys.stderr)
         else:
             if has_umi:
-                # pivot guide x UMI
+                # pivot guide x UIB
                 rows = {}
                 for key, val in pairCounts_double.items():
                     if '++' in key:
@@ -500,7 +505,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Process raw R1/R2 sequencing data from screens to counts files, "
-            "with optional UMI detection from read IDs."
+            "with optional UIB (integration barcode) detection from read IDs."
         )
     )
     parser.add_argument("Guide_Table", help="Table of sgRNA pairs in the library (CSV).")
@@ -518,7 +523,7 @@ def parse_args():
         "--UMI_Table",
         dest="UMI_Table",
         default=None,
-        help="Optional table listing valid UMIs (column name: UMI). Required if UMIs are present in read IDs.",
+        help="Table listing valid UIBs (column name: UMI). Required if UIBs are present in read IDs.",
     )
     parser.add_argument(
         "--test",
@@ -549,7 +554,7 @@ def parse_args():
     parser.add_argument(
         "--umi-allow-one-mismatch",
         action="store_true",
-        help="Allow 1-mismatch matching for UMIs (default: exact only).",
+        help="Allow 1-mismatch matching for UIBs (default: exact only).",
     )
     parser.add_argument(
         "--write-stats-file",
@@ -755,8 +760,8 @@ def resolve_seq_files(patterns: List[str]) -> List[str]:
 
 def read_and_validate_umi_table(path: str | None, allow_one_mismatch: bool) -> pd.Series | None:
     """
-    If a UMI table is provided, validate that it exists and has a 'UMI' column.
-    Returns a Series of UMIs or None.
+    If a UIB table is provided, validate that it exists and has a 'UMI' column.
+    Returns a Series of UIBs or None.
     """
     if path is None:
         return None
@@ -775,9 +780,9 @@ def read_and_validate_umi_table(path: str | None, allow_one_mismatch: bool) -> p
     if df["UMI"].isna().all():
         raise ValueError(f"UMI table '{path}' has no non-empty UMIs in column 'UMI'.")
 
-    print('UMIs in table', df.shape[0])
+    print('UIBs in table', df.shape[0])
 
-    umiMismatchDict = getMismatchDict(df, 'UMI', allowOneMismatch=allow_one_mismatch)
+    umiMismatchDict = getMismatchDict(df, 'UMI', allowOneMismatch=allow_one_mismatch, id_column='UMI')
 
     return umiMismatchDict
 
@@ -814,6 +819,8 @@ if __name__ == '__main__':
         elif i % 2 == 1:
             r2file = fastqfile
             sample_has_umi = peek_has_umi(r1file)
+            if sample_has_umi and umiMismatchDict is None:
+                raise ValueError("UIBs detected in read IDs but no UIB table was provided. Supply --UMI_Table.")
             use_umi_whitelist = umiMismatchDict is not None
             sample_name = os.path.split(fastqfile)[-1].split('_R')[0]
             # Drop trailing Illumina chunk like _S##_L00# if present for consistency
